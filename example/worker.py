@@ -4,10 +4,12 @@
 
 from celery import Celery
 
+# amqp://guest:guest@localhost:5672/
 app = Celery(
     'tasks',
-    broker='redis://',
-    backend='redis://',
+    # 从Makefile 参数中获取
+    # broker='redis://localhost:6379/0',
+    # backend='redis://localhost:6379/0',
 )
 
 app.conf.update(

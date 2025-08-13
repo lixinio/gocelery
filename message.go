@@ -27,9 +27,9 @@ type CeleryMessage struct {
 func (cm *CeleryMessage) reset() {
 	cm.Headers = nil
 	cm.Body = ""
-	cm.Properties.CorrelationID = uuid.Must(uuid.NewV4()).String()
-	cm.Properties.ReplyTo = uuid.Must(uuid.NewV4()).String()
-	cm.Properties.DeliveryTag = uuid.Must(uuid.NewV4()).String()
+	cm.Properties.CorrelationID = uuid.NewV4().String()
+	cm.Properties.ReplyTo = uuid.NewV4().String()
+	cm.Properties.DeliveryTag = uuid.NewV4().String()
 }
 
 var celeryMessagePool = sync.Pool{
@@ -40,15 +40,15 @@ var celeryMessagePool = sync.Pool{
 			ContentType: "application/json",
 			Properties: CeleryProperties{
 				BodyEncoding:  "base64",
-				CorrelationID: uuid.Must(uuid.NewV4()).String(),
-				ReplyTo:       uuid.Must(uuid.NewV4()).String(),
+				CorrelationID: uuid.NewV4().String(),
+				ReplyTo:       uuid.NewV4().String(),
 				DeliveryInfo: CeleryDeliveryInfo{
 					Priority:   0,
 					RoutingKey: "celery",
 					Exchange:   "celery",
 				},
 				DeliveryMode: 2,
-				DeliveryTag:  uuid.Must(uuid.NewV4()).String(),
+				DeliveryTag:  uuid.NewV4().String(),
 			},
 			ContentEncoding: "utf-8",
 		}
@@ -121,7 +121,7 @@ type TaskMessage struct {
 }
 
 func (tm *TaskMessage) reset() {
-	tm.ID = uuid.Must(uuid.NewV4()).String()
+	tm.ID = uuid.NewV4().String()
 	tm.Task = ""
 	tm.Args = nil
 	tm.Kwargs = nil
@@ -131,7 +131,7 @@ var taskMessagePool = sync.Pool{
 	New: func() interface{} {
 		eta := time.Now().Format(time.RFC3339)
 		return &TaskMessage{
-			ID:      uuid.Must(uuid.NewV4()).String(),
+			ID:      uuid.NewV4().String(),
 			Retries: 0,
 			Kwargs:  nil,
 			ETA:     &eta,
@@ -187,6 +187,10 @@ type ResultMessage struct {
 	Traceback interface{}   `json:"traceback"`
 	Result    interface{}   `json:"result"`
 	Children  []interface{} `json:"children"`
+}
+
+func (rm *ResultMessage) UnmarshalBinary(data []byte) error {
+	return json.Unmarshal(data, rm)
 }
 
 func (rm *ResultMessage) reset() {
