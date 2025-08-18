@@ -5,137 +5,117 @@
 package gocelery
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"strings"
 	"time"
 
-	"github.com/streadway/amqp"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// AMQPExchange stores AMQP Exchange configuration
-type AMQPExchange struct {
-	Name       string
-	Type       string
-	Durable    bool
-	AutoDelete bool
-}
+const defaultExchange = "celery"
 
-// NewAMQPExchange creates new AMQPExchange
-func NewAMQPExchange(name string) *AMQPExchange {
-	return &AMQPExchange{
-		Name:       name,
-		Type:       "direct",
-		Durable:    true,
-		AutoDelete: true,
-	}
-}
-
-// AMQPQueue stores AMQP Queue configuration
-type AMQPQueue struct {
-	Name       string
-	Durable    bool
-	AutoDelete bool
-}
-
-// NewAMQPQueue creates new AMQPQueue
-func NewAMQPQueue(name string) *AMQPQueue {
-	return &AMQPQueue{
-		Name:       name,
-		Durable:    true,
-		AutoDelete: false,
-	}
-}
-
-//AMQPCeleryBroker is RedisBroker for AMQP
+// AMQPCeleryBroker is RedisBroker for AMQP
 type AMQPCeleryBroker struct {
-	*amqp.Channel
-	Connection       *amqp.Connection
-	Exchange         *AMQPExchange
-	Queue            *AMQPQueue
-	consumingChannel <-chan amqp.Delivery
-	Rate             int
+	channel      *amqp.Channel
+	Connection   *amqp.Connection
+	Host         string
+	ExchangeName string
 }
 
 // NewAMQPConnection creates new AMQP channel
-func NewAMQPConnection(host string) (*amqp.Connection, *amqp.Channel) {
-	connection, err := amqp.Dial(host)
+func NewAMQPConnection(
+	host string,
+) (*amqp.Connection, *amqp.Channel, error) {
+	uri, err := amqp.ParseURI(host)
 	if err != nil {
-		panic(err)
+		return nil, nil, err
+	}
+
+	config := amqp.Config{
+		Dial: func(network, addr string) (net.Conn, error) {
+			return net.DialTimeout(network, addr, 5*time.Second)
+		},
+	}
+
+	connection, err := amqp.DialConfig(host, config)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"dial '%s:%d%s' fail, err '%w'",
+			uri.Host, uri.Port, uri.Vhost, err,
+		)
 	}
 
 	channel, err := connection.Channel()
 	if err != nil {
-		panic(err)
+		connection.Close()
+		return nil, nil, fmt.Errorf(
+			"get channel fail, url '%s:%d%s', err '%w'",
+			uri.Host, uri.Port, uri.Vhost, err,
+		)
 	}
-	return connection, channel
+
+	return connection, channel, nil
+}
+
+func NewCeleryBroker(
+	ctx context.Context, host, exchange string,
+) (CeleryBroker, error) {
+	if strings.HasPrefix(host, "amqp://") {
+		return NewAMQPCeleryBroker(ctx, host, exchange)
+	} else if strings.HasPrefix(host, "redis://") {
+		return NewRedisCeleryBroker(host, exchange)
+	} else {
+		return nil, fmt.Errorf("unsupport schema '%s'", host)
+	}
 }
 
 // NewAMQPCeleryBroker creates new AMQPCeleryBroker
-func NewAMQPCeleryBroker(host string) *AMQPCeleryBroker {
-	return NewAMQPCeleryBrokerByConnAndChannel(NewAMQPConnection(host))
+func NewAMQPCeleryBroker(
+	ctx context.Context, host, exchange string,
+) (*AMQPCeleryBroker, error) {
+	conn, channel, err := NewAMQPConnection(host)
+	if err != nil {
+		return nil, err
+	}
+
+	if exchange == "" {
+		exchange = defaultExchange
+	}
+
+	return &AMQPCeleryBroker{
+		channel:      channel,
+		Connection:   conn,
+		Host:         host,
+		ExchangeName: exchange,
+	}, nil
 }
 
-// NewAMQPCeleryBrokerByConnAndChannel creates new AMQPCeleryBroker using AMQP conn and channel
-func NewAMQPCeleryBrokerByConnAndChannel(conn *amqp.Connection, channel *amqp.Channel) *AMQPCeleryBroker {
-	broker := &AMQPCeleryBroker{
-		Channel:    channel,
-		Connection: conn,
-		Exchange:   NewAMQPExchange("default"),
-		Queue:      NewAMQPQueue("celery"),
-		Rate:       4,
-	}
-	if err := broker.CreateExchange(); err != nil {
-		panic(err)
-	}
-	if err := broker.CreateQueue(); err != nil {
-		panic(err)
-	}
-	if err := broker.Qos(broker.Rate, 0, false); err != nil {
-		panic(err)
-	}
-	if err := broker.StartConsumingChannel(); err != nil {
-		panic(err)
-	}
-	return broker
-}
+func (b *AMQPCeleryBroker) Reconnect(context.Context) error {
+	_ = b.channel.Close()
+	_ = b.Connection.Close()
 
-// StartConsumingChannel spawns receiving channel on AMQP queue
-func (b *AMQPCeleryBroker) StartConsumingChannel() error {
-	channel, err := b.Consume(b.Queue.Name, "", false, false, false, false, nil)
+	conn, channel, err := NewAMQPConnection(b.Host)
 	if err != nil {
 		return err
 	}
-	b.consumingChannel = channel
+
+	b.channel = channel
+	b.Connection = conn
+
 	return nil
 }
 
 // SendCeleryMessage sends CeleryMessage to broker
-func (b *AMQPCeleryBroker) SendCeleryMessage(message *CeleryMessage) error {
-	taskMessage := message.GetTaskMessage()
-	queueName := "celery"
-	_, err := b.QueueDeclare(
-		queueName, // name
-		true,      // durable
-		false,     // autoDelete
-		false,     // exclusive
-		false,     // noWait
-		nil,       // args
+func (b *AMQPCeleryBroker) SendCeleryMessage(
+	ctx context.Context, message *CeleryMessage,
+) error {
+	var (
+		taskMessage = message.GetTaskMessage()
+		err         error
 	)
-	if err != nil {
-		return err
-	}
-	err = b.ExchangeDeclare(
-		"default",
-		"direct",
-		true,
-		true,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
-	}
 
 	resBytes, err := json.Marshal(taskMessage)
 	if err != nil {
@@ -149,52 +129,16 @@ func (b *AMQPCeleryBroker) SendCeleryMessage(message *CeleryMessage) error {
 		Body:         resBytes,
 	}
 
-	return b.Publish(
-		"",
-		queueName,
-		false,
-		false,
-		publishMessage,
+	return parseAndRetry(
+		ctx, "PublishWithContext", func() error {
+			return b.channel.PublishWithContext(
+				ctx,
+				b.ExchangeName,
+				b.ExchangeName,
+				false,
+				false,
+				publishMessage,
+			)
+		}, b,
 	)
-}
-
-// GetTaskMessage retrieves task message from AMQP queue
-func (b *AMQPCeleryBroker) GetTaskMessage() (*TaskMessage, error) {
-	select {
-	case delivery := <-b.consumingChannel:
-		deliveryAck(delivery)
-		var taskMessage TaskMessage
-		if err := json.Unmarshal(delivery.Body, &taskMessage); err != nil {
-			return nil, err
-		}
-		return &taskMessage, nil
-	default:
-		return nil, fmt.Errorf("consuming channel is empty")
-	}
-}
-
-// CreateExchange declares AMQP exchange with stored configuration
-func (b *AMQPCeleryBroker) CreateExchange() error {
-	return b.ExchangeDeclare(
-		b.Exchange.Name,
-		b.Exchange.Type,
-		b.Exchange.Durable,
-		b.Exchange.AutoDelete,
-		false,
-		false,
-		nil,
-	)
-}
-
-// CreateQueue declares AMQP Queue with stored configuration
-func (b *AMQPCeleryBroker) CreateQueue() error {
-	_, err := b.QueueDeclare(
-		b.Queue.Name,
-		b.Queue.Durable,
-		b.Queue.AutoDelete,
-		false,
-		false,
-		nil,
-	)
-	return err
 }
